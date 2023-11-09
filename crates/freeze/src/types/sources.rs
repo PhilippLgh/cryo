@@ -1,17 +1,17 @@
-use std::sync::Arc;
+use std::{sync::Arc, num::NonZeroU32};
 
 use ethers::prelude::*;
 use governor::{
     clock::DefaultClock,
     middleware::NoOpMiddleware,
-    state::{direct::NotKeyed, InMemoryState},
+    state::{direct::NotKeyed, InMemoryState}, Quota,
 };
 use tokio::{
     sync::{AcquireError, Semaphore, SemaphorePermit},
     task,
 };
+use crate::{err, CollectError, ParseError};
 
-use crate::CollectError;
 
 /// RateLimiter based on governor crate
 pub type RateLimiter = governor::RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>;
@@ -775,7 +775,6 @@ impl<P: JsonRpcClient> Fetcher<P> {
     }
 }
 
-use crate::err;
 use std::collections::BTreeMap;
 
 fn parse_geth_diff_object(
@@ -788,4 +787,131 @@ fn parse_geth_diff_object(
         .map_err(|_| err("cannot deserialize pre diff"))?;
 
     Ok(DiffMode { pre, post })
+}
+
+/// Builder pattern for sources
+pub struct SourceBuilder {
+  rpc_url: String,
+  max_retries: u32,
+  initial_backoff: u64, // TODO can be u32 or less?
+  requests_per_second: Option<u32>,
+  max_concurrent_requests: u32,
+  inner_request_size: u64,            // TODO can be u32 or less?
+  max_concurrent_chunks: Option<u64>, // TODO can be u32 or less?
+}
+
+impl Default for SourceBuilder {
+  fn default() -> Self {
+      SourceBuilder {
+          rpc_url: "http://127.0.0.1:8545".to_string(),
+          max_retries: 5,
+          initial_backoff: 500,
+          requests_per_second: Some(10),
+          max_concurrent_requests: 10,
+          inner_request_size: 1,
+          max_concurrent_chunks: Some(4),
+      }
+  }
+}
+
+impl SourceBuilder {
+  /// initialize SourceBuilder
+  pub fn new() -> Self {
+      SourceBuilder {
+          ..Default::default()
+      }
+  }
+
+  /// Set rpc url
+  pub fn rpc_url(mut self, rpc_url: String) -> Self {
+      self.rpc_url = rpc_url;
+      self
+  }
+
+  /// Max retries for provider errors
+  pub fn max_retries(mut self, max_retries: u32) -> Self {
+      self.max_retries = max_retries;
+      self
+  }
+
+  /// Initial retry backoff time (ms)
+  pub fn initial_backoff(mut self, initial_backoff: u64) -> Self {
+      self.initial_backoff = initial_backoff;
+      self
+  }
+
+  /// Ratelimit on requests per second
+  pub fn requests_per_second(mut self, requests_per_second: Option<u32>) -> Self {
+      self.requests_per_second = requests_per_second;
+      self
+  }
+
+  /// Global number of concurrent requests
+  pub fn max_concurrent_requests(mut self, max_concurrent_requests: u32) -> Self {
+      self.max_concurrent_requests = max_concurrent_requests;
+      self
+  }
+
+  /// Set blocks per request (eth_getLogs)
+  pub fn inner_request_size(mut self, inner_request_size: u64) -> Self {
+      self.inner_request_size = inner_request_size;
+      self
+  }
+
+  /// Set global number of concurrent requests
+  pub fn max_concurrent_chunks(mut self, max_concurrent_chunks: Option<u64>) -> Self {
+      self.max_concurrent_chunks = max_concurrent_chunks;
+      self
+  }
+
+  /// Build a new source
+  pub async fn build(self) -> Result<Source> {
+      let rpc_url = self.rpc_url;
+      let max_retries = self.max_retries;
+      let initial_backoff = self.initial_backoff; // ms
+      let requests_per_second = self.requests_per_second;
+      let max_concurrent_requests = self.max_concurrent_requests;
+      let inner_request_size = self.inner_request_size;
+      // TODO set to number of cores?
+      let max_concurrent_chunks = self.max_concurrent_chunks;
+
+      let one = NonZeroU32::new(1).unwrap();
+      let max_burst = NonZeroU32::new(max_concurrent_requests).unwrap();
+      let quota = Quota::per_second(max_burst).allow_burst(one);
+      let rate_limiter = Some(RateLimiter::direct(quota));
+
+      let provider =
+          Provider::<RetryClient<Http>>::new_client(&rpc_url, max_retries, initial_backoff)
+              .unwrap();
+      let chain_id = provider
+          .get_chainid()
+          .await
+          .map_err(ParseError::ProviderError)?
+          .as_u64();
+
+      let semaphore = tokio::sync::Semaphore::new(max_concurrent_requests as usize);
+      let semaphore = Some(semaphore);
+
+      let fetcher = Fetcher {
+          provider,
+          semaphore,
+          rate_limiter,
+      };
+
+      let source = Source {
+          fetcher: Arc::new(fetcher),
+          inner_request_size: inner_request_size,
+          max_concurrent_chunks,
+          // TODO redundant with fetcher.provider
+          chain_id,
+          rpc_url: rpc_url.to_string(),
+          labels: SourceLabels {
+              max_concurrent_requests: requests_per_second.map(|x| x as u64),
+              max_requests_per_second: requests_per_second.map(|x| x as u64),
+              max_retries: Some(max_retries),
+              initial_backoff: Some(initial_backoff),
+          },
+      };
+      Ok(source)
+  }
 }
